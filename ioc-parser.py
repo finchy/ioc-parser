@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 ###################################################################################################
 #
@@ -45,7 +45,8 @@ import sys
 import fnmatch
 import argparse
 import re
-from StringIO import StringIO
+import io
+import tempfile
 try:
     import configparser as ConfigParser
 except ImportError:
@@ -77,6 +78,11 @@ try:
     IMPORTS.append('requests')
 except ImportError:
     pass
+try:
+    import pikepdf
+    IMPORTS.append('pikepdf')
+except ImportError:
+    pass
 
 # Import additional project source files
 import output
@@ -85,7 +91,7 @@ from whitelist import WhiteList
 class IOC_Parser(object):
     patterns = {}
 
-    def __init__(self, patterns_ini, input_format = 'pdf', output_format='csv', dedup=False, library='pypdf2'):
+    def __init__(self, patterns_ini, input_format='pdf', output_format='csv', dedup=False, library='pypdf2'):
         basedir = os.path.dirname(os.path.abspath(__file__))
         self.load_patterns(patterns_ini)
         self.whitelist = WhiteList(basedir)
@@ -113,7 +119,7 @@ class IOC_Parser(object):
     def load_patterns(self, fpath):
         config = ConfigParser.ConfigParser()
         with open(fpath) as f:
-            config.readfp(f)
+            config.read_file(f)
 
         for ind_type in config.sections():
             try:
@@ -133,27 +139,34 @@ class IOC_Parser(object):
         return False
 
     def parse_page(self, fpath, data, page_num):
+        results = {
+            "Domain": [],
+            "Filename": [],
+            "BuildID": [],
+            "SHA256": []
+        }
         for ind_type, ind_regex in self.patterns.items():
             matches = ind_regex.findall(data)
-
             for ind_match in matches:
                 if isinstance(ind_match, tuple):
                     ind_match = ind_match[0]
-
                 if self.is_whitelisted(ind_match, ind_type):
                     continue
-
                 if self.dedup:
                     if (ind_type, ind_match) in self.dedup_store:
                         continue
-
                     self.dedup_store.add((ind_type, ind_match))
-
                 self.handler.print_match(fpath, page_num, ind_type, ind_match)
+                if ind_type in results:
+                    results[ind_type].append(ind_match)
+        return results
 
     def parse_pdf_pypdf2(self, f, fpath):
         try:
-            pdf = PdfFileReader(f, strict = False)
+            pdf = PdfFileReader(f, strict=False)
+
+            if pdf.isEncrypted:
+                pdf.decrypt('')  # Attempt to decrypt with empty password
 
             if self.dedup:
                 self.dedup_store = set()
@@ -163,7 +176,7 @@ class IOC_Parser(object):
             for page in pdf.pages:
                 page_num += 1
 
-                data = page.extractText()
+                data = page.extract_text()
 
                 self.parse_page(fpath, data, page_num)
             self.handler.print_footer(fpath)
@@ -172,7 +185,7 @@ class IOC_Parser(object):
         except Exception as e:
             self.handler.print_error(fpath, e)
 
-    def parse_pdf_pdfminer(self, f, fpath):
+    def parse_pdf_pdfminer(self, fpath):
         try:
             laparams = LAParams()
             laparams.all_texts = True  
@@ -184,32 +197,54 @@ class IOC_Parser(object):
 
             self.handler.print_header(fpath)
             page_num = 0
-            for page in PDFPage.get_pages(f, pagenos, check_extractable=True):
-                page_num += 1
+            with open(fpath, 'rb') as f:
+                for page in PDFPage.get_pages(f, pagenos, check_extractable=True):
+                    page_num += 1
 
-                retstr = StringIO()
-                device = TextConverter(rsrcmgr, retstr, laparams=laparams)
-                interpreter = PDFPageInterpreter(rsrcmgr, device)
-                interpreter.process_page(page)
-                data = retstr.getvalue()
-                retstr.close()
+                    retstr = io.StringIO()
+                    device = TextConverter(rsrcmgr, retstr, laparams=laparams)
+                    interpreter = PDFPageInterpreter(rsrcmgr, device)
+                    interpreter.process_page(page)
+                    data = retstr.getvalue()
+                    retstr.close()
 
-                self.parse_page(fpath, data, page_num)
+                    self.parse_page(fpath, data, page_num)
             self.handler.print_footer(fpath)
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception as e:
             self.handler.print_error(fpath, e)
 
-    def parse_pdf(self, f, fpath):
-        parser_format = "parse_pdf_" + self.library
+    def parse_pdf_pikepdf(self, fpath):
         try:
-            self.parser_func = getattr(self, parser_format)
-        except AttributeError:
-            e = 'Selected PDF parser library is not supported: %s' % (self.library)
-            raise NotImplementedError(e)
-            
-        self.parser_func(f, fpath)
+            with pikepdf.open(fpath) as pdf:
+                with tempfile.NamedTemporaryFile(delete=False) as temp_pdf:
+                    pdf.save(temp_pdf)
+                    temp_pdf_path = temp_pdf.name
+                    temp_pdf.close()
+                    results = self.parse_pdf_pdfminer(temp_pdf_path)
+                    os.remove(temp_pdf_path)  # Clean up the temporary file
+                    return results
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            self.handler.print_error(fpath, e)
+            return {"Domain": [], "Filename": [], "BuildID": [], "SHA256": []}
+
+
+    def parse_pdf(self, fpath):
+        try:
+            if self.library == 'pypdf2':
+                with open(fpath, 'rb') as f:
+                    self.parse_pdf_pypdf2(f, fpath)
+            elif self.library == 'pdfminer':
+                self.parse_pdf_pdfminer(fpath)
+            elif self.library == 'pikepdf':
+                self.parse_pdf_pikepdf(fpath)
+            else:
+                raise NotImplementedError(f'PDF library {self.library} is not supported')
+        except Exception as e:
+            self.handler.print_error(fpath, e)
 
     def parse_txt(self, f, fpath):
         try:
@@ -231,17 +266,17 @@ class IOC_Parser(object):
                 self.dedup_store = set()
                 
             data = f.read()
-            soup = BeautifulSoup(data)
+            soup = BeautifulSoup(data, 'html.parser')
             html = soup.findAll(text=True)
 
             text = u''
             for elem in html:
                 if elem.parent.name in ['style', 'script', '[document]', 'head', 'title']:
                     continue
-                elif re.match('<!--.*-->', unicode(elem)):
+                elif re.match('<!--.*-->', str(elem)):
                     continue
                 else:
-                    text += unicode(elem)
+                    text += str(elem)
 
             self.handler.print_header(fpath)
             self.parse_page(fpath, text, 1)
@@ -260,19 +295,17 @@ class IOC_Parser(object):
                 headers = { 'User-Agent': 'Mozilla/5.0 Gecko Firefox' }
                 r = requests.get(path, headers=headers)
                 r.raise_for_status()
-                f = StringIO(r.content)
+                f = io.BytesIO(r.content)
                 self.parser_func(f, path)
                 return
             elif os.path.isfile(path):
-                with open(path, 'rb') as f:
-                    self.parser_func(f, path)
+                self.parser_func(path)
                 return
             elif os.path.isdir(path):
                 for walk_root, walk_dirs, walk_files in os.walk(path):
                     for walk_file in fnmatch.filter(walk_files, self.ext_filter):
                         fpath = os.path.join(walk_root, walk_file)
-                        with open(fpath, 'rb') as f:
-                            self.parser_func(f, fpath)
+                        self.parser_func(fpath)
                 return
 
             e = 'File path is not a file, directory or URL: %s' % (path)
@@ -289,7 +322,7 @@ if __name__ == "__main__":
     argparser.add_argument('-i', dest='INPUT_FORMAT', default='pdf', help='Input format (pdf/txt)')
     argparser.add_argument('-o', dest='OUTPUT_FORMAT', default='csv', help='Output format (csv/json/yara)')
     argparser.add_argument('-d', dest='DEDUP', action='store_true', default=False, help='Deduplicate matches')
-    argparser.add_argument('-l', dest='LIB', default='pdfminer', help='PDF parsing library (pypdf2/pdfminer)')
+    argparser.add_argument('-l', dest='LIB', default='pdfminer', help='PDF parsing library (pypdf2/pdfminer/pikepdf)')
 
     args = argparser.parse_args()
 
